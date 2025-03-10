@@ -1,0 +1,521 @@
+FeatureScript 1824;
+import(path : "onshape/std/geometry.fs", version : "1824.0");
+
+/**
+ * Snap-Fit Connection Generator for 3D printing
+ * Creates optimized snap-fit connections between selected parts
+ */
+export annotation { "Feature Type Name" : "Snap-Fit Connection" }
+export const snapFitConnection = function(context is Context, id is Id, definition is map)
+    precondition
+    {
+        // Validate inputs before executing
+        if (definition.snapType == SnapType.CANTILEVER && definition.beamLength <= 0)
+        {
+            throw regenError("Beam length must be greater than zero for cantilever snaps");
+        }
+        
+        if (definition.snapDepth <= 0)
+        {
+            throw regenError("Snap depth must be greater than zero");
+        }
+        
+        if (definition.clearance < 0)
+        {
+            throw regenError("Clearance cannot be negative");
+        }
+    }
+    {
+        // Main function body
+        var firstSelection = definition.maleComponent;
+        var secondSelection = definition.femaleComponent;
+        
+        // Initialize tracking variables for generated entities
+        var maleFeatures = [];
+        var femaleFeatures = [];
+        
+        // Generate the appropriate snap type based on selection
+        if (definition.snapType == SnapType.CANTILEVER)
+        {
+            generateCantileverSnap(context, id, definition, firstSelection, secondSelection, maleFeatures, femaleFeatures);
+        }
+        else if (definition.snapType == SnapType.CYLINDRICAL)
+        {
+            generateCylindricalSnap(context, id, definition, firstSelection, secondSelection, maleFeatures, femaleFeatures);
+        }
+        
+        // Add optimization for 3D printing
+        optimize3DPrint(context, id, definition, maleFeatures, femaleFeatures);
+        
+        // Validate the generated features
+        validatePrintability(context, id, definition, maleFeatures, femaleFeatures);
+    };
+
+/**
+ * Enum for snap-fit types
+ */
+enum SnapType
+{
+    annotation { "Name" : "Cantilever" }
+    CANTILEVER,
+    
+    annotation { "Name" : "Cylindrical" }
+    CYLINDRICAL
+}
+
+/**
+ * Generate a cantilever snap-fit connection
+ */
+function generateCantileverSnap(context is Context, id is Id, definition is map, 
+                               maleComponent is Query, femaleComponent is Query,
+                               maleFeatures is array, femaleFeatures is array)
+{
+    // Calculate the appropriate dimensions based on parameters
+    var beamLength = definition.beamLength;
+    var beamWidth = definition.beamWidth; 
+    var beamThickness = definition.beamThickness;
+    var snapDepth = definition.snapDepth;
+    var overhangAngle = definition.overhangAngle * degree;
+    var clearance = definition.clearance;
+    
+    // Get the geometric properties of the selected components
+    var maleGeometry = evaluateQuery(context, maleComponent);
+    var femaleGeometry = evaluateQuery(context, femaleComponent);
+    
+    // Create transformation for proper positioning
+    var maleCentroid = evCentroid(context, maleGeometry);
+    var femaleCentroid = evCentroid(context, femaleGeometry);
+    var directionVector = normalize(femaleCentroid - maleCentroid);
+    
+    // Calculate the snap beam location
+    var snapLocation = maleCentroid + directionVector * definition.positionOffset;
+    
+    // Create the coordinate system for the male component snap
+    var csMatrix = evCsFromNormalAndXAxis(context, {
+        origin : snapLocation,
+        normal : directionVector,
+        xAxis : perpendicularVector(directionVector)
+    });
+    
+    // Build the male component (hook part)
+    var maleSketchPlane = plane(csMatrix);
+    var maleSketch = newSketch(context, id + "maleSketch", {
+        "sketchPlane" : maleSketchPlane
+    });
+    
+    // Create the base of the cantilever beam
+    skRectangle(maleSketch, "beamBase", {
+        "center" : vector(0, 0) * meter,
+        "width" : beamWidth,
+        "height" : beamThickness
+    });
+    
+    // Create the beam with hook
+    var points = [
+        vector(0, 0) * meter,
+        vector(beamLength, 0) * meter,
+        vector(beamLength, beamThickness / 2) * meter,
+        vector(beamLength + snapDepth, beamThickness / 2) * meter,
+        vector(beamLength + snapDepth, beamThickness) * meter,
+        vector(0, beamThickness) * meter
+    ];
+    
+    skPolyline(maleSketch, "beamProfile", {
+        "points" : points
+    });
+    
+    // Add chamfer to reduce stress concentration
+    var chamferSize = min(beamThickness * 0.2, 1 * millimeter);
+    
+    skLineSegment(maleSketch, "chamfer1", {
+        "start" : vector(beamLength, beamThickness / 2) * meter,
+        "end" : vector(beamLength + chamferSize, beamThickness / 2 + chamferSize) * meter
+    });
+    
+    // Extrude the male component
+    var maleExtrude = extrude(context, id + "maleExtrude", {
+        "entities" : qSketchRegion(id + "maleSketch"),
+        "direction" : directionVector,
+        "endBound" : BoundingType.BLIND,
+        "endDepth" : beamWidth
+    });
+    maleFeatures.push(maleExtrude);
+    
+    // Build the female component (receiver part)
+    var femaleSketchPlane = plane(csMatrix);
+    var femaleSketch = newSketch(context, id + "femaleSketch", {
+        "sketchPlane" : femaleSketchPlane
+    });
+    
+    // Create the receiver cavity
+    var cavityPoints = [
+        vector(-clearance, -clearance) * meter,
+        vector(beamLength + snapDepth + clearance, -clearance) * meter,
+        vector(beamLength + snapDepth + clearance, beamThickness + clearance) * meter,
+        vector(-clearance, beamThickness + clearance) * meter
+    ];
+    
+    skPolyline(femaleSketch, "cavity", {
+        "points" : cavityPoints
+    });
+    
+    // Add entrance chamfer for easy assembly
+    var entranceOffset = tan(overhangAngle) * beamThickness;
+    
+    skLineSegment(femaleSketch, "entranceChamfer", {
+        "start" : vector(-clearance - entranceOffset, -clearance) * meter,
+        "end" : vector(-clearance, beamThickness + clearance) * meter
+    });
+    
+    // Extrude the female component (cutting operation)
+    var femaleCut = cut(context, id + "femaleCut", {
+        "entities" : qSketchRegion(id + "femaleSketch"),
+        "direction" : directionVector,
+        "endBound" : BoundingType.BLIND,
+        "endDepth" : beamWidth + clearance * 2
+    });
+    femaleFeatures.push(femaleCut);
+}
+
+/**
+ * Generate a cylindrical snap-fit connection
+ */
+function generateCylindricalSnap(context is Context, id is Id, definition is map, 
+                                maleComponent is Query, femaleComponent is Query,
+                                maleFeatures is array, femaleFeatures is array)
+{
+    // Calculate the appropriate dimensions based on parameters
+    var cylinderDiameter = definition.cylinderDiameter;
+    var snapDepth = definition.snapDepth;
+    var ringThickness = definition.ringThickness;
+    var clearance = definition.clearance;
+    var overhangAngle = definition.overhangAngle * degree;
+    
+    // Get the geometric properties of the selected components
+    var maleGeometry = evaluateQuery(context, maleComponent);
+    var femaleGeometry = evaluateQuery(context, femaleComponent);
+    
+    // Create transformation for proper positioning
+    var maleCentroid = evCentroid(context, maleGeometry);
+    var femaleCentroid = evCentroid(context, femaleGeometry);
+    var directionVector = normalize(femaleCentroid - maleCentroid);
+    
+    // Calculate the snap location
+    var snapLocation = maleCentroid + directionVector * definition.positionOffset;
+    
+    // Create the coordinate system for the snap components
+    var csMatrix = evCsFromNormalAndXAxis(context, {
+        origin : snapLocation,
+        normal : directionVector,
+        xAxis : perpendicularVector(directionVector)
+    });
+    
+    // Build the male component (post with protruding lip)
+    var malePostSketch = newSketch(context, id + "malePostSketch", {
+        "sketchPlane" : plane(csMatrix)
+    });
+    
+    // Create the base post
+    skCircle(malePostSketch, "postBase", {
+        "center" : vector(0, 0) * meter,
+        "radius" : cylinderDiameter / 2
+    });
+    
+    // Extrude the base post
+    var malePostExtrude = extrude(context, id + "malePostExtrude", {
+        "entities" : qSketchRegion(id + "malePostSketch"),
+        "direction" : directionVector,
+        "endBound" : BoundingType.BLIND,
+        "endDepth" : definition.postHeight
+    });
+    maleFeatures.push(malePostExtrude);
+    
+    // Create the snap lip at the end of the post
+    var snapLipSketch = newSketch(context, id + "snapLipSketch", {
+        "sketchPlane" : plane(evaluate(context, qAxisPlane(malePostExtrude, directionVector, definition.postHeight)))
+    });
+    
+    // Draw the lip profile
+    skArc(snapLipSketch, "lipArc", {
+        "center" : vector(0, 0) * meter,
+        "start" : vector(cylinderDiameter / 2, 0) * meter,
+        "end" : vector((cylinderDiameter / 2 + snapDepth) * cos(overhangAngle), 
+                       (cylinderDiameter / 2 + snapDepth) * sin(overhangAngle)) * meter,
+        "clockwise" : false
+    });
+    
+    skArc(snapLipSketch, "lipArcFillet", {
+        "center" : vector(0, 0) * meter,
+        "start" : vector((cylinderDiameter / 2 + snapDepth) * cos(overhangAngle), 
+                         (cylinderDiameter / 2 + snapDepth) * sin(overhangAngle)) * meter,
+        "end" : vector(0, cylinderDiameter / 2 + snapDepth) * meter,
+        "clockwise" : false
+    });
+    
+    skLineSegment(snapLipSketch, "lipStraight", {
+        "start" : vector(0, cylinderDiameter / 2 + snapDepth) * meter,
+        "end" : vector(0, 0) * meter
+    });
+    
+    // Revolve the lip to create the 3D snap feature
+    var snapLipRevolve = revolve(context, id + "snapLipRevolve", {
+        "entities" : qSketchRegion(id + "snapLipSketch"),
+        "axis" : line(vector(0, 0, 0) * meter, directionVector),
+        "angleDegree" : 360
+    });
+    maleFeatures.push(snapLipRevolve);
+    
+    // Build the female component (receiver with internal groove)
+    var femaleRingSketch = newSketch(context, id + "femaleRingSketch", {
+        "sketchPlane" : plane(csMatrix)
+    });
+    
+    // Create the outer and inner circles for the ring
+    skCircle(femaleRingSketch, "ringOuter", {
+        "center" : vector(0, 0) * meter,
+        "radius" : cylinderDiameter / 2 + snapDepth + ringThickness + clearance
+    });
+    
+    skCircle(femaleRingSketch, "ringInner", {
+        "center" : vector(0, 0) * meter,
+        "radius" : cylinderDiameter / 2 - clearance
+    });
+    
+    // Extrude the ring
+    var femaleRingExtrude = extrude(context, id + "femaleRingExtrude", {
+        "entities" : qSketchRegion(id + "femaleRingSketch"),
+        "direction" : directionVector,
+        "endBound" : BoundingType.BLIND,
+        "endDepth" : definition.ringHeight
+    });
+    femaleFeatures.push(femaleRingExtrude);
+    
+    // Create the internal groove for the snap
+    var grooveOffset = definition.postHeight - snapDepth * 0.5;
+    var grooveSketchPlane = plane(evaluate(context, qAxisPlane(femaleRingExtrude, directionVector, grooveOffset)));
+    
+    var grooveSketch = newSketch(context, id + "grooveSketch", {
+        "sketchPlane" : grooveSketchPlane
+    });
+    
+    // Draw the groove profile (rectangle)
+    skAnnulus(grooveSketch, "groove", {
+        "center" : vector(0, 0) * meter,
+        "innerRadius" : cylinderDiameter / 2 - clearance,
+        "outerRadius" : cylinderDiameter / 2 + snapDepth + clearance
+    });
+    
+    // Create the groove by cutting
+    var grooveCut = cut(context, id + "grooveCut", {
+        "entities" : qSketchRegion(id + "grooveSketch"),
+        "direction" : directionVector,
+        "endBound" : BoundingType.BLIND,
+        "endDepth" : snapDepth + clearance
+    });
+    femaleFeatures.push(grooveCut);
+    
+    // Add entry chamfer for easy assembly
+    var chamferSketch = newSketch(context, id + "chamferSketch", {
+        "sketchPlane" : plane(evaluate(context, qAxisPlane(femaleRingExtrude, directionVector, 0)))
+    });
+    
+    skAnnulus(chamferSketch, "entryChamfer", {
+        "center" : vector(0, 0) * meter,
+        "innerRadius" : cylinderDiameter / 2 - clearance,
+        "outerRadius" : cylinderDiameter / 2 + snapDepth / 2
+    });
+    
+    var chamferCut = cut(context, id + "chamferCut", {
+        "entities" : qSketchRegion(id + "chamferSketch"),
+        "direction" : directionVector,
+        "endBound" : BoundingType.BLIND,
+        "endDepth" : snapDepth / 2
+    });
+    femaleFeatures.push(chamferCut);
+}
+
+/**
+ * Optimize the generated features for 3D printing
+ */
+function optimize3DPrint(context is Context, id is Id, definition is map,
+                        maleFeatures is array, femaleFeatures is array)
+{
+    // Add fillets to reduce stress concentrations
+    if (definition.addFillets)
+    {
+        var filletRadius = min(definition.filletRadius, 
+                             definition.snapType == SnapType.CANTILEVER ? 
+                                 definition.beamThickness * 0.2 :
+                                 definition.ringThickness * 0.2);
+        
+        // Apply fillets to stress points in male component
+        for (var feature in maleFeatures)
+        {
+            var edges = qEdgeAdjacent(feature, EntityType.FACE);
+            fillet(context, id + "maleFillet", {
+                "entities" : edges,
+                "radius" : filletRadius
+            });
+        }
+        
+        // Apply fillets to stress points in female component
+        for (var feature in femaleFeatures)
+        {
+            var edges = qEdgeAdjacent(feature, EntityType.FACE);
+            fillet(context, id + "femaleFillet", {
+                "entities" : edges,
+                "radius" : filletRadius
+            });
+        }
+    }
+    
+    // Add draft angles if needed for better printability
+    if (definition.addDraftAngles)
+    {
+        var draftAngle = definition.draftAngle * degree;
+        
+        for (var feature in maleFeatures)
+        {
+            var faces = qCreatedBy(feature, EntityType.FACE);
+            draft(context, id + "maleDraft", {
+                "entities" : faces,
+                "draftAngle" : draftAngle,
+                "pullDirection" : vector(0, 0, 1)
+            });
+        }
+        
+        for (var feature in femaleFeatures)
+        {
+            var faces = qCreatedBy(feature, EntityType.FACE);
+            draft(context, id + "femaleDraft", {
+                "entities" : faces,
+                "draftAngle" : draftAngle,
+                "pullDirection" : vector(0, 0, 1)
+            });
+        }
+    }
+}
+
+/**
+ * Validate the printability of the generated features
+ */
+function validatePrintability(context is Context, id is Id, definition is map,
+                            maleFeatures is array, femaleFeatures is array)
+{
+    // Check for minimum wall thickness
+    var minWallThickness = 0.8 * millimeter; // Typical minimum for FDM printing
+    
+    if ((definition.snapType == SnapType.CANTILEVER && definition.beamThickness < minWallThickness) ||
+        (definition.snapType == SnapType.CYLINDRICAL && definition.ringThickness < minWallThickness))
+    {
+        addNotice(context, id, "Warning: Wall thickness may be too thin for reliable 3D printing", NoticeType.WARNING);
+    }
+    
+    // Check for overhang angles that might require supports
+    var maxOverhangAngle = 45 * degree;
+    
+    if (definition.overhangAngle > maxOverhangAngle)
+    {
+        addNotice(context, id, "Warning: Overhang angle exceeds 45 degrees and may require supports during printing", NoticeType.WARNING);
+    }
+    
+    // Check for snap force concerns
+    if (definition.snapType == SnapType.CANTILEVER)
+    {
+        var estimatedDeflection = definition.snapDepth;
+        var estimatedStrain = estimatedDeflection / definition.beamLength;
+        
+        // Most printed materials can handle ~3-5% strain before breaking
+        if (estimatedStrain > 0.05)
+        {
+            addNotice(context, id, "Warning: Snap deflection may be too high for the beam length, consider reducing snap depth or increasing beam length", NoticeType.WARNING);
+        }
+    }
+}
+
+/**
+ * Utility function to get a perpendicular vector to the given direction
+ */
+function perpendicularVector(direction is Vector)
+{
+    const worldZ = vector(0, 0, 1);
+    
+    if (abs(dot(direction, worldZ)) < 0.9)
+    {
+        return normalize(cross(direction, worldZ));
+    }
+    else
+    {
+        return normalize(cross(direction, vector(1, 0, 0)));
+    }
+}
+
+// UI definition for the feature
+annotation { "Feature Type Name" : "Snap-Fit Connection" }
+export const snapFitConnectionDefinition = defineFeature(function(context is Context, id is Id, definition is map)
+    {
+        // Feature parameters UI
+        if (definition.snapType == undefined)
+        {
+            definition.snapType = SnapType.CANTILEVER;
+        }
+        
+        // Common parameters
+        annotation { "Name" : "Male Component", "Filter" : EntityType.FACE || EntityType.BODY, "MaxNumberOfPicks" : 1 }
+        definition.maleComponent is Query;
+        
+        annotation { "Name" : "Female Component", "Filter" : EntityType.FACE || EntityType.BODY, "MaxNumberOfPicks" : 1 }
+        definition.femaleComponent is Query;
+        
+        annotation { "Name" : "Snap Type", "UIHint" : UIHint.HORIZONTAL_ENUM }
+        definition.snapType is SnapType;
+        
+        annotation { "Name" : "Position Offset", "Default" : 10 * millimeter, "MinValue" : 0 }
+        isLength(definition.positionOffset, ZERO_LENGTH_BOUNDS);
+        
+        annotation { "Name" : "Clearance", "Default" : 0.2 * millimeter, "MinValue" : 0 }
+        isLength(definition.clearance, ZERO_LENGTH_BOUNDS);
+        
+        annotation { "Name" : "Snap Depth", "Default" : 1 * millimeter, "MinValue" : 0.1 * millimeter }
+        isLength(definition.snapDepth, ZERO_LENGTH_BOUNDS);
+        
+        annotation { "Name" : "Overhang Angle", "Default" : 30, "MinValue" : 10, "MaxValue" : 60 }
+        isAngle(definition.overhangAngle);
+        
+        // Type-specific parameters
+        if (definition.snapType == SnapType.CANTILEVER)
+        {
+            annotation { "Group Name" : "Cantilever Parameters" }
+            annotation { "Name" : "Beam Length", "Default" : 15 * millimeter, "MinValue" : 1 * millimeter }
+            isLength(definition.beamLength, ZERO_LENGTH_BOUNDS);
+            
+            annotation { "Name" : "Beam Width", "Default" : 5 * millimeter, "MinValue" : 1 * millimeter }
+            isLength(definition.beamWidth, ZERO_LENGTH_BOUNDS);
+            
+            annotation { "Name" : "Beam Thickness", "Default" : 1.5 * millimeter, "MinValue" : 0.8 * millimeter }
+            isLength(definition.beamThickness, ZERO_LENGTH_BOUNDS);
+        }
+        else if (definition.snapType == SnapType.CYLINDRICAL)
+        {
+            annotation { "Group Name" : "Cylindrical Parameters" }
+            annotation { "Name" : "Cylinder Diameter", "Default" : 10 * millimeter, "MinValue" : 3 * millimeter }
+            isLength(definition.cylinderDiameter, ZERO_LENGTH_BOUNDS);
+            
+            annotation { "Name" : "Post Height", "Default" : 10 * millimeter, "MinValue" : 1 * millimeter }
+            isLength(definition.postHeight, ZERO_LENGTH_BOUNDS);
+            
+            annotation { "Name" : "Ring Height", "Default" : 8 * millimeter, "MinValue" : 1 * millimeter }
+            isLength(definition.ringHeight, ZERO_LENGTH_BOUNDS);
+            
+            annotation { "Name" : "Ring Thickness", "Default" : 2 * millimeter, "MinValue" : 0.8 * millimeter }
+            isLength(definition.ringThickness, ZERO_LENGTH_BOUNDS);
+        }
+        
+        // 3D Printing Optimization
+        annotation { "Group Name" : "3D Printing Optimization" }
+        annotation { "Name" : "Add Fillets", "Default" : true }
+        isBoolean(definition.addFillets);
+        
+        if (definition.addFillets)
+        {
+            annotation { "Name" : "Fillet Rad
